@@ -180,6 +180,41 @@ class GPT(nn.Module):
 
         return model
     
+import tiktoken
+
+# 训练数据生成 这里使用顺序固定点采样
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        
+        # 读出磁盘数据到内存中
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        # 输出总 token 数以及一个 epoch 含多少个 batch
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        
+        # 记录当前读到哪个 batch
+        self.cur_pos = 0
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        # 将当前组需要的 token 读到 buf 中
+        buf = self.tokens[self.cur_pos : self.cur_pos + B*T + 1]
+        # 对 buf 错位切割得到一一对应的 x, y
+        x = (buf[:-1]).reshape(B, T)
+        y = (buf[1:]).reshape(B, T)
+        # 更新当前位置
+        self.cur_pos += B * T
+        # 如果下一个 Batch 对应的 buf 数据超过 tokens 边界，重置
+        if self.cur_pos + B * T + 1 > len(self.tokens):
+            self.cur_pos = 0
+        return x, y
+    
 # -----------------------------------------------------------------------------
 # 自动检测设备
 device = "cpu"
@@ -193,26 +228,14 @@ print(f"using device: {device}")
 model = GPT(GPTConfig())
 model.to(device)
 
-# 使用分词器（需要与 GPT2 一致）生成示例样本
-import tiktoken
-# 从 input.txt 中读取文本数据
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-# 获取 GPT2 的分词器，用于生成 vocab_index 向量
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode(text)
-# 整理成用于模型训练的 Batch
-B, T = 4, 32
-# +1 为了让最后一个 seq 的末尾位置有对应的 y
-buf = torch.tensor(tokens[:B*T + 1])
-# 错位截取 buf，得到 x 一一对应 y
-x = buf[:-1].reshape(B, T).to(device)
-y = buf[1:].reshape(B, T).to(device)
+# 创建数据加载器实例
+train_loader = DataLoaderLite(B=4, T=32)
 
 # 使用优化器进行模型训练
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    x, y  = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
