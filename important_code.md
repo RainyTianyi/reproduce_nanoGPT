@@ -52,3 +52,18 @@ topk_probs, topk_indices 的形状都是 (B, 50)。
 multinomial(prob_list, n_sample) 按 prob_list 相对权重采样 n_sample 次。这里返回采样结果对应的 prob_list 索引 (B, 1)。
 
 torch.gather(input, dim, index)沿指定维度，根据索引张量 index 从输入张量 input 中逐个元素地“收集”值。这里返回 vocab 索引 (B, 1)。
+
+--------------------
+
+```python
+# GPT 中使用了 embedding 权重共享
+# 即 token embedding 和最后的线性层共享权重，减少大量参数的同时提高模型性能
+self.transformer.wte.weight = self.lm_head.weight
+```
+
+线性层默认存储的矩阵形状顺序和创建时是相反的，即使用 nn.Linear(n_i, n_o) 得到的权重矩阵形状为 (n_o, n_i)，这里恰好与 token embedding 层形状一致。
+
+同时利用 nn.Module 对赋值操作的重写，实现了这两层的 weight 指向显存中同一块矩阵（nn.Parameter）。
+
+--------------------
+

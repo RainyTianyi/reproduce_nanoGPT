@@ -31,6 +31,8 @@ class CausalSelfAttention(nn.Module):
         # 记录 head 和 embd 数量，用于 forward 时做多头注意力
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        # 注意力层输出后就是 res，所以需要使用 scale 初始化
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         
     def forward(self, x):
         # 从输入读取信息：batch_size, seq_len, n_embd
@@ -67,6 +69,8 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate='tanh') # 使用 GELU（优化 ReLU）的 tanh 近似
         # GPT2 使用了 tanh 近似，理由是运算更快。实际上现在已经直接使用 GELU 的为多数。
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        # MLP 输出后就是 res，所以需要使用 scale 初始化
+        self.c_proj.NANOGPT_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_proj(self.gelu(self.c_fc(x)))
@@ -102,10 +106,33 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),   # Transformer 解码器层
             ln_f = nn.LayerNorm(config.n_embd) # GPT2 新增层归一化
         ))
-        
         # 最后的线性层，转回词表
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
+        # GPT 中使用了 embedding 权重共享
+        # 即 token embedding 和最后的线性层共享权重，减少大量参数的同时提高模型性能
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        # 使用 GPT2 的初始化方法
+        self.apply(self._init_weights)
+    
+    # GPT2 有自己的权重初始化方法    
+    def _init_weights(self, module):
+        # 对于线性层一般用 std=0.02
+        # 但针对 res 之前的输出，为了稳定输出的方差，进行 scale
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # 统计总共进行 res 的次数，进行 std scale
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                # GPT2 对 bias 项统一使用 0 初始化，而不是 torch 的均匀分布
+                torch.nn.init.zeros_(module.bias)
+        # 对于嵌入层同样用 std=0.02
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            
     def forward(self, idx, labels=None):
         # idx (B, T)
         B, T = idx.size()
@@ -223,6 +250,10 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
+
+# 设置初始化的随机种子
+torch.manual_seed(1337)
+torch.cuda.manual_seed(1337)
 
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
