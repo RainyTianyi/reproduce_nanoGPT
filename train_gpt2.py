@@ -210,9 +210,14 @@ buf = torch.tensor(tokens[:B*T + 1])
 x = buf[:-1].reshape(B, T).to(device)
 y = buf[1:].reshape(B, T).to(device)
 
-# 检查目前的 Batch 操作是否能够正常运行
-logits, loss = model(x, y)
-print(loss)
+# 使用优化器进行模型训练
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
 import sys; sys.exit(0)
 
 # 使用训练好的模型进行预测
