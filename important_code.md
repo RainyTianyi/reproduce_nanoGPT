@@ -67,3 +67,43 @@ self.transformer.wte.weight = self.lm_head.weight
 
 --------------------
 
+# SECTION2
+
+## Class GPT
+
+```python
+# 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
+torch.set_float32_matmul_precision('high')
+```
+
+下面是 Nvidia 文档中关于 TF32 的介绍。
+![TF32](<pic/TF32 in GEMM.png>)
+
+在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，理想情况下可以带来 8 倍的速度提升。
+
+`torch.set_float32_matmul_precision` 控制 **float32 矩阵乘法（matmul）的内部计算精度**，在**性能**和**数值精度**之间进行权衡：允许内部计算使用较低精度的数据类型（如 TF32 或 bfloat16），显著提升矩阵运算速度，输出的数据类型仍然是 float32。
+
+### 三种精度模式
+
+该函数接受一个字符串参数，有三种可选值，其内部计算机制和精度/性能对比如下：
+
+| 模式 | 内部计算数据类型 | 精度（尾数位） | 相对性能 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`"highest"`** (默认) | **float32** | 23 位显式存储 | 基准（较低） | 使用完整的 float32 精度进行计算，数值最精确，但速度最慢。 |
+| **`"high"`** | **TensorFloat32 (TF32)** 或 **bfloat16_3x** | 约 10-14 位 | 较高 | 优先使用 TF32（10 位尾数）；若无支持，则采用一种基于 3 个 bfloat16 数的算法（约 14 位有效尾数），在精度和速度间取得良好平衡。 |
+| **`"medium"`** | **bfloat16** | 7 位显式存储 | 最高 | 直接使用 bfloat16 进行内部计算，速度最快，但精度损失最大。若硬件不支持快速的 bfloat16 矩阵乘法，则会回退到 `"high"` 模式。 |
+
+> **关于 `"high"` 模式的 bfloat16_3x 算法**：其原理是将一个 float32 数拆分为三个 bfloat16 数的和（因为 float32 的 23 位尾数 ≈ 3 × 7 位 bfloat16 尾数）。两个 float32 相乘可表示为 9 个 bfloat16 乘积之和，`"high"` 模式仅保留其中最重要的 3 个乘积，从而在利用 bfloat16 高速运算单元的同时，尽可能保留精度。
+
+### 行为与注意事项
+
+*   **仅影响 CUDA 设备**
+*   **不改变输出 dtype**
+*   **不影响卷积运算**：卷积操作的精度由其他标志控制，例如 `torch.backends.cudnn.allow_tf32`。
+*   **硬件依赖**：`"high"` 和 `"medium"` 模式带来的加速主要依赖于 **NVIDIA Ampere 架构（如 A100、RTX 30 系列）及更新的 GPU**，因为它们支持 TF32 和 bfloat16 的 Tensor Core 加速。在 Volta (V100) 等较旧架构上，设置这些模式可能不会带来性能提升。
+*   **与 `allow_tf32` 的等价关系**：
+    *   设置为 `"highest"` 等价于 `torch.backends.cuda.matmul.allow_tf32 = False`。
+    *   设置为 `"high"` 或 `"medium"` 等价于 `torch.backends.cuda.matmul.allow_tf32 = True`。
+
+---
+
