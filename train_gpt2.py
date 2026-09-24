@@ -106,6 +106,25 @@ class GPT(nn.Module):
         # 最后的线性层，转回词表
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
+    def forward(self, idx):
+        # idx (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # 从原始的 vocab_index 转为 token embedding 并添加 position embedding
+        tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos) # (T, n_embd)
+        # 广播机制
+        x = tok_emb + pos_emb   # (B, T, n_embd)
+        # 在 Transformer 块中前递
+        for block in self.transformer.h:
+            x = block(x)
+        # 通过 GPT2 添加的归一化层
+        x = self.transformer.ln_f(x)
+        # 通过最后的线性层，转回词表
+        x  = self.lm_head(x)
+        return x
+        
     # 定义方法，导入 Hugging Face 下载的权重
     @classmethod
     def from_pretrained(cls, model_type):
