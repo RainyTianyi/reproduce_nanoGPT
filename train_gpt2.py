@@ -262,7 +262,7 @@ model = GPT(GPTConfig())
 model.to(device)
 
 # 创建数据加载器实例
-train_loader = DataLoaderLite(B=4, T=1024)
+train_loader = DataLoaderLite(B=2, T=1024)
 
 # 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
 torch.set_float32_matmul_precision('high')
