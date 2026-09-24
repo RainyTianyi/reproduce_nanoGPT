@@ -41,3 +41,134 @@
 
 总结：`n_head`/`n_embd` 是超参，`self.bias` 是防作弊的视线遮挡板，而打印出来的 `bias` 是网络真正的可学习偏置参数。
 
+
+## GPT 输出处理
+
+这段代码是在做 **自回归生成下一个 token**，其中 `top-k` 是一种采样策略。
+
+### 为什么要做 top-k？
+
+GPT-2 每个位置会输出整个词表上的概率分布。词表通常有 5 万多个 token。
+
+如果直接对整个词表做 `multinomial` 采样：
+
+- 高概率 token 当然容易被选中；
+- 但大量低概率 token 虽然单个概率很小，数量却极多，累积起来也可能被抽到；
+- 一旦抽到这些“长尾”里的奇怪 token，生成文本就可能不连贯、跑偏、胡言乱语。
+
+所以 `top-k` 的作用是：
+
+> 只保留概率最高的 k 个 token，把其余低概率 token 全部排除，然后只在这 k 个候选里按概率采样。
+
+这里 `k = 50`，是 HuggingFace pipeline 的常见默认值。  
+它相当于在“贪心搜索”和“完全随机采样”之间折中：
+
+- `k` 太小：生成更保守，可能重复；
+- `k` 太大：更随机，但可能引入噪声；
+- `k = 50`：保留一定多样性，同时过滤长尾垃圾 token。
+
+---
+
+### top-k 后的代码逻辑
+
+逐行看：
+
+```python
+logits = model(x)              # (B, T, vocab_size)
+logits = logits[:, -1, :]      # (B, vocab_size)
+```
+
+模型输出每个位置对下一个 token 的预测，这里只取最后一个时间步，因为要预测“下一个 token”。
+
+```python
+probs = F.softmax(logits, dim=-1)
+```
+
+把 logits 变成整个词表上的概率分布。
+
+```python
+topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+```
+
+- `topk_probs`：形状 `(B, 50)`，每个样本概率最高的 50 个概率值；
+- `topk_indices`：形状 `(B, 50)`，这 50 个概率对应的**原始词表 token id**。
+
+注意：`topk_indices` 不是 0 到 49，而是原始词表里的真实 token id。
+
+```python
+ix = torch.multinomial(topk_probs, 1)   # (B, 1)
+```
+
+在每一行的 top-50 概率里，按概率随机抽一个。
+
+- `ix` 的形状是 `(B, 1)`；
+- 它的取值是 `0 ~ 49`；
+- 它表示“选中了该样本 top-50 列表中的第几个”。
+
+这里 `torch.multinomial` 不要求输入概率之和为 1。它会按相对权重采样，所以等价于：先在这 50 个候选里重新归一化，再采样。
+
+```python
+xcol = torch.gather(topk_indices, -1, ix)   # (B, 1)
+```
+
+因为 `ix` 只是 top-50 内部的位置，不是原始词表 id，所以要用 `gather` 把它映射回原始 token id。
+
+可以理解为：
+
+```python
+xcol[b, 0] = topk_indices[b, ix[b, 0]]
+```
+
+于是 `xcol` 就是每个 batch 样本真正选中的下一个 token。
+
+```python
+x = torch.cat((x, xcol), dim=1)
+```
+
+把新生成的 token 拼到序列末尾，序列长度加 1，继续循环，直到达到 `max_length`。
+
+---
+
+### 举个简单例子
+
+假设某个样本的原始词表概率是：
+
+```text
+token id:   0     1     2     3     4     5
+probs:     0.05  0.40  0.20  0.15  0.10  0.10
+```
+
+取 `top-k = 3`：
+
+```python
+topk_probs   = [0.40, 0.20, 0.15]
+topk_indices = [1, 2, 3]
+```
+
+然后 `multinomial` 在 `[0.40, 0.20, 0.15]` 上采样，假设返回：
+
+```python
+ix = [2]
+```
+
+表示选中了 top-3 中的第 2 个位置，即：
+
+```python
+topk_indices[2] = 3
+```
+
+所以最终生成的下一个 token id 是 `3`，而不是 `2`。
+
+---
+
+### 总结
+
+- `top-k` 的目的：过滤掉低概率长尾 token，只在最高概率的 `k` 个 token 中采样，提升生成质量。
+- `top-k` 后的逻辑：
+  1. 对每个样本取概率最高的 50 个 token；
+  2. 在这 50 个 token 中按概率随机采样；
+  3. 得到的是 top-50 内部的位置；
+  4. 用 `gather` 映射回原始词表 token id；
+  5. 拼接到原序列后面，继续生成下一个 token。
+
+所以核心就是：**截断长尾 → 在 top-k 内按概率采样 → 映射回真实 token → 拼接继续生成。**

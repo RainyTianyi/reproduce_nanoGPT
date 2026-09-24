@@ -176,5 +176,44 @@ class GPT(nn.Module):
         return model
     
 # -----------------------------------------------------------------------------
+num_return_sequences = 5
+max_length = 30
+
 model = GPT.from_pretrained('gpt2')
-print("didn't crash yay!")
+model.eval()
+model.to('cuda')
+
+# 使用分词器（需要与 GPT2 一致）生成示例样本
+import tiktoken
+# 获取 GPT2 的分词器，生成 vocab_index 向量
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)
+# 展开 Batch 维度，并进行重复指定次数
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens.to('cuda')
+
+# 使用 GPT 进行推理，x (B, T)
+# 统一随机种子便于复现
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+# 用循环实现逐步前推
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x)
+        # 取出最新的输出
+        logits = logits[:, -1, :]   # (B, vocab_size)
+        # 按照概率进行输出（随机取样）
+        probs = F.softmax(logits, dim=-1)   # 获取模型输出的概率值
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)    # 取 topk 概率值
+        ix = torch.multinomial(topk_probs, 1)   # 按照概率，随机选择 topk 中的索引
+        # 使用 gather 取出索引对应的 vocab_index
+        xcol = torch.gather(topk_indices, -1, ix)
+        # 将输出结果添加到 x 后方，用于继续向后预测
+        x = torch.cat((x, xcol), dim=-1)
+
+# 打印模型输出的序列
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist() # 使用 tolist 将张量送回 CPU 并转回标准数据结构
+    decoded = enc.decode(tokens)
+    print(">", decoded)

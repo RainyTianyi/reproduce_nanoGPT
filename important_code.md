@@ -35,3 +35,20 @@ transformer.h.0.attn.c_attn.weight
 transformer.h.0.attn.c_attn.bias
 ```
 
+--------------------
+
+```python
+# 按照概率进行输出（随机取样）
+probs = F.softmax(logits, dim=-1)   # 获取模型输出的概率值
+topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)    # 取 topk 概率值
+ix = torch.multinomial(topk_probs, 1)   # 按照概率，随机选择 topk 中的索引
+# 使用 gather 取出索引对应的 vocab_index
+xcol = torch.gather(topk_indices, -1, ix)
+```
+
+只保留概率最高的 k 个 token，把其余低概率 token 全部排除，然后只在这 k 个候选里按概率采样。
+topk_probs, topk_indices 的形状都是 (B, 50)。
+
+multinomial(prob_list, n_sample) 按 prob_list 相对权重采样 n_sample 次。这里返回采样结果对应的 prob_list 索引 (B, 1)。
+
+torch.gather(input, dim, index)沿指定维度，根据索引张量 index 从输入张量 input 中逐个元素地“收集”值。这里返回 vocab 索引 (B, 1)。
