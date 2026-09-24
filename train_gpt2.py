@@ -106,7 +106,7 @@ class GPT(nn.Module):
         # 最后的线性层，转回词表
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
-    def forward(self, idx):
+    def forward(self, idx, labels=None):
         # idx (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -122,8 +122,13 @@ class GPT(nn.Module):
         # 通过 GPT2 添加的归一化层
         x = self.transformer.ln_f(x)
         # 通过最后的线性层，转回词表
-        x  = self.lm_head(x)
-        return x
+        x = self.lm_head(x) # (B, T, vocab_size)
+        # 返回 logits ，训练时同时返回损失函数
+        loss = None
+        if labels is not None:
+            # 交叉熵损失函数需要二维-一维输入，用于计算
+            loss = F.cross_entropy(x.reshape(-1, x.size(-1)), labels.reshape(-1))
+        return x, loss
         
     # 定义方法，导入 Hugging Face 下载的权重
     @classmethod
@@ -206,8 +211,8 @@ x = buf[:-1].reshape(B, T).to(device)
 y = buf[1:].reshape(B, T).to(device)
 
 # 检查目前的 Batch 操作是否能够正常运行
-logits = model(x)
-print(logits.shape)
+logits, loss = model(x, y)
+print(loss)
 import sys; sys.exit(0)
 
 # 使用训练好的模型进行预测
