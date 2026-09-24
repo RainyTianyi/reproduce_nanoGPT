@@ -184,18 +184,36 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-num_return_sequences = 5
-max_length = 30
-
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
-model.eval()
 model.to(device)
 
 # 使用分词器（需要与 GPT2 一致）生成示例样本
 import tiktoken
-# 获取 GPT2 的分词器，生成 vocab_index 向量
+# 从 input.txt 中读取文本数据
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+# 获取 GPT2 的分词器，用于生成 vocab_index 向量
 enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode(text)
+# 整理成用于模型训练的 Batch
+B, T = 4, 32
+# +1 为了让最后一个 seq 的末尾位置有对应的 y
+buf = torch.tensor(tokens[:B*T + 1])
+# 错位截取 buf，得到 x 一一对应 y
+x = buf[:-1].reshape(B, T).to(device)
+y = buf[1:].reshape(B, T).to(device)
+
+# 检查目前的 Batch 操作是否能够正常运行
+logits = model(x)
+print(logits.shape)
+import sys; sys.exit(0)
+
+# 使用训练好的模型进行预测
+model.eval()
+num_return_sequences = 5
+max_length = 30
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long)
 # 展开 Batch 维度，并进行重复指定次数
