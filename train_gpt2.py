@@ -275,7 +275,9 @@ for i in range(50):
     x, y  = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    # 在计算过程中，进一步使用 BF16 来减少内存开销和数据传输开销
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     

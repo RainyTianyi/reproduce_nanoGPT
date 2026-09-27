@@ -107,3 +107,15 @@ torch.set_float32_matmul_precision('high')
 
 ---
 
+```python
+# 在计算过程中，进一步使用 BF16 来减少内存开销和数据传输开销
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+```
+
+BF16 比传统的 FP16 用精度换取更大（达到 FP32 和 TF32）的数值表示范围，避免了在网络训练过程中的 gradient scaling 操作。但我们不希望在所有的网络值上都降低精读，例如损失函数的计算。框架帮我们实现了这一点，即只对部分运算采用 BF16 而对精度敏感的计算仍使用 FP32。具体可以查框架的文档。
+
+需要注意的是，pytorch autocast 规定**不要在模型中显式使用**如 dtype=torch.bfloat16 这样的声明，而是使用 with 块括起模型的前向传播部分。同时，**不建议把反向传播和优化器计算**放到 autocast 块中。
+
+---
+
