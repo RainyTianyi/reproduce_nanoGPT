@@ -264,7 +264,7 @@ torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
 
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # 使用 torch 提供的神经网络专用编译器
 model = torch.compile(model)
