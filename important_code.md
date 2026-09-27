@@ -163,3 +163,6 @@ y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 ```
 
 实际上 Flash Attention 比传统的注意力计算有更多的浮点数运算次数，但由于其极大减少了 GPU 访存次数，带来的加速效果可以达到约 7 倍。这就指出了在优化计算时间时，**优化访存方式往往比优化计算速度更加有效**。
+
+# SECTION3
+
