@@ -260,6 +260,8 @@ torch.cuda.manual_seed(1337)
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 model.to(device)
+# 使用 torch 提供的神经网络专用编译器
+model = torch.compile(model)
 
 # 创建数据加载器实例
 train_loader = DataLoaderLite(B=2, T=1024)

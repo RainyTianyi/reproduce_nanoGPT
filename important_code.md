@@ -69,7 +69,7 @@ self.transformer.wte.weight = self.lm_head.weight
 
 # SECTION2
 
-## Class GPT
+## 训练代码
 
 ```python
 # 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
@@ -109,8 +109,8 @@ torch.set_float32_matmul_precision('high')
 
 ```python
 # 在计算过程中，进一步使用 BF16 来减少内存开销和数据传输开销
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
+with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    logits, loss = model(x, y)
 ```
 
 BF16 比传统的 FP16 用精度换取更大（达到 FP32 和 TF32）的数值表示范围，避免了在网络训练过程中的 gradient scaling 操作。但我们不希望在所有的网络值上都降低精读，例如损失函数的计算。框架帮我们实现了这一点，即只对部分运算采用 BF16 而对精度敏感的计算仍使用 FP32。具体可以查框架的文档。
@@ -119,3 +119,19 @@ BF16 比传统的 FP16 用精度换取更大（达到 FP32 和 TF32）的数值�
 
 ---
 
+```python
+# 使用 torch 提供的神经网络专用编译器
+model = torch.compile(model)
+```
+
+torch 为自己的 model 提供了专用的编译器，**用编译时间的较少增长换取网络训练时间的较大减少**。大部分情况下，我们希望默认使用 torch.compile，除了极少数的 debug 情况。
+
+python 编译器在编译 model 计算（前向传播和反向传播）时，会严格按照编码步骤一步一步实现，这样得到的程序在 GPU 上运行时，无法知道下一步要做什么数值运算。这样就需要 GPU 反复读写显存带来大量开销。
+
+而 torch 编译器**会读完整个模型代码**，然后把整个模型当作一个整体做实现。相似的步骤（如 GELU 中大量对矩阵逐个值操作）会一次性在 GPU 内运算完成，大大减少读写开销。
+
+值得注意的是**存在 torch.compile 无法编译的操作**，如下面要引入的 Flash Attention。
+
+---
+
+## CausalSelfAttention
