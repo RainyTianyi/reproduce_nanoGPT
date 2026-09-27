@@ -128,10 +128,30 @@ torch 为自己的 model 提供了专用的编译器，**用编译时间的较�
 
 python 编译器在编译 model 计算（前向传播和反向传播）时，会严格按照编码步骤一步一步实现，这样得到的程序在 GPU 上运行时，无法知道下一步要做什么数值运算。这样就需要 GPU 反复读写显存带来大量开销。
 
-而 torch 编译器**会读完整个模型代码**，然后把整个模型当作一个整体做实现。相似的步骤（如 GELU 中大量对矩阵逐个值操作）会一次性在 GPU 内运算完成，大大减少读写开销。
+而 torch 编译器**会读完整个模型代码**，然后把整个模型当作一个整体做实现。相似的步骤（如 GELU 中大量对矩阵逐个值操作）会一次性在 GPU 内运算完成，大大减少读写开销。（这里说的本质上是一种内核融合技术，是 torch.compile 用于加速的方法之一）
 
-值得注意的是**存在 torch.compile 无法编译的操作**，如下面要引入的 Flash Attention。
+值得注意的是**存在 torch.compile 无法加速的操作**，如下面要引入的 Flash Attention。
 
 ---
 
 ## CausalSelfAttention
+
+```python
+# 缩放点积计算注意力权重
+att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+# 使用掩码 maseked_fill(条件，True时用以覆盖的值)
+att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+# Softmax 后得到注意力权重
+att = F.softmax(att, dim=-1)
+# 计算加权平均值
+y = att @ v
+```
+
+针对这四步运算，因为涉及到注意力操作的运算设计，torch.compile 是无法识别这里的内核融合操作的，也就是会保留逐步运算的实现（约 17ms）。Flash Attention 通过 online softmax 技巧**将注意力操作的运算进行内核融合**，使得一次运算的时间减少至约 3ms。（可以参考 Flash Attention 论文以及 online softmax 论文）
+
+```python
+# 使用 torch 实现的 Flash Attention
+y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+```
+
+实际上 Flash Attention 比传统的注意力计算有更多的浮点数运算次数，但由于其极大减少了 GPU 访存次数，带来的加速效果可以达到约 7 倍。这就指出了在优化计算时间时，**优化访存方式往往比优化计算速度更加有效**。

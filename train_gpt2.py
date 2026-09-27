@@ -45,6 +45,8 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        
+        """使用传统注意力
         # 缩放点积计算注意力权重
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         # 使用掩码 maseked_fill(条件，True时用以覆盖的值)
@@ -53,6 +55,10 @@ class CausalSelfAttention(nn.Module):
         att = F.softmax(att, dim=-1)
         # 计算加权平均值
         y = att @ v
+        """
+        # 使用 torch 实现的 Flash Attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         # 恢复形状 并通过交换维度和 reshape 连接多头注意力各自的输出
         y = y.transpose(1, 2).reshape(B, T, C)
         # 对 concat 后的结果做输出投影
