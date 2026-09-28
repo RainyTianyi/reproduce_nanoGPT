@@ -275,10 +275,31 @@ train_loader = DataLoaderLite(B=2, T=1024)
 # 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
 torch.set_float32_matmul_precision('high')
 
+# 学习率调度器（可变学习率函数），按照 GPT3 实现
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+# 根据训练步数推进，改变学习率
+def get_lr(it):
+    # 线性 warmup
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps   # it+1 避免 0 学习率
+    # 超过 max_steps 后使用 10% 最大学习率
+    if it > max_steps:
+        return min_lr
+    # 中间段使用余弦函数衰减 先计算出系数
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    # 用系数进行余弦函数衰减
+    return min_lr + coeff * (max_lr - min_lr)
+
 # 使用优化器进行模型训练
 # 按照 GPT3 论文设置超参数
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-for i in range(50):
+# GPT 原文实际训练超过 max_steps 次，但这里先用 max_steps。
+for step in range(max_steps):
     t0 = time.time()
     
     x, y  = train_loader.next_batch()
@@ -290,6 +311,10 @@ for i in range(50):
     loss.backward()
     # 添加梯度裁剪，控制模型优化的速度
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # 使用学习率调度器
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr  # 这里实际上只有一个参数组，是 torch 要求用这种方式指定优化器学习率
     optimizer.step()
     
     torch.cuda.synchronize()    # 等待 GPU 计算完成
@@ -297,7 +322,7 @@ for i in range(50):
     dt = t1 - t0
     tokens_processed = train_loader.B * train_loader.T
     tokens_per_sec = tokens_processed / dt
-    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     
 import sys; sys.exit(0)
 
