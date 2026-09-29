@@ -1,4 +1,5 @@
 import math
+import inspect
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -213,6 +214,35 @@ class GPT(nn.Module):
 
         return model
     
+    # 添加优化器初始化：指定 weight decay 与使用 fused AdamW
+    # 根据 GPT 论文，只对 2D 形状的参数做 weight decay
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # 获取所有需要梯度的参数
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # 区分是否需要进行 weight dacay，只对 2D 形状的参数做
+        # 如对所有参与矩阵乘法和嵌入层做权重衰退，而 bias 和层归一化的参数不做衰退
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        # 统计两种参数各自的个数并打印
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # 使用 fused AdamW 即使用 cuda 内核融合后的优化器
+        # 自动检测是否能使用 fused
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        # 指定优化器并返回
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+    
+# -----------------------------------------------------------------------------
 import tiktoken
 
 # 训练数据生成 这里使用顺序固定点采样
@@ -297,7 +327,8 @@ def get_lr(it):
 
 # 使用优化器进行模型训练
 # 按照 GPT3 论文设置超参数
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
 # GPT 原文实际训练超过 max_steps 次，但这里先用 max_steps。
 for step in range(max_steps):
     t0 = time.time()
@@ -309,7 +340,7 @@ for step in range(max_steps):
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
-    # 添加梯度裁剪，控制模型优化的速度
+    # 添加梯度裁剪，控制模型优化的速度。函数返回裁剪前的梯度向量范数
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # 使用学习率调度器
     lr = get_lr(step)

@@ -166,3 +166,69 @@ y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 # SECTION3
 
+## 训练代码
+
+```python
+# 添加梯度裁剪，控制模型优化的速度。函数返回裁剪前的梯度向量范数
+norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+```
+
+梯度裁剪，相当于控制优化器一次优化的步幅大小。在训练初期，通常能够避免大幅度优化，增强训练的稳定性。
+
+需要注意的是，梯度裁剪相当于需要遍历一遍所有反向传播计算得到的梯度值，会带来性能下降。
+
+---
+
+```python
+# 使用学习率调度器
+lr = get_lr(step)
+for param_group in optimizer.param_groups:
+    param_group['lr'] = lr  # 这里实际上只有一个参数组，是 torch 要求用这种方式指定优化器学习率
+```
+
+实际上 torch 自带一些学习率调度器可以使用，位于 torch.optim.lr_scheduler 模块。这里因为 GPT 的学习率有 warmup，cos_decay 以及后续的平稳段，函数较复杂，我们使用自定义的方式。
+
+使用自定义学习率函数时，torch 规定**必须用这种方法**给优化器传递学习率。
+
+---
+
+## Class GPT
+
+```python
+# 添加优化器初始化：指定 weight decay 与使用 fused AdamW
+# 根据 GPT 论文，只对 2D 形状的参数做 weight decay
+def configure_optimizers(self, weight_decay, learning_rate, device):
+    # 获取所有需要梯度的参数
+    param_dict = {pn: p for pn, p in self.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # 区分是否需要进行 weight dacay，只对 2D 形状的参数做
+    # 如对所有参与矩阵乘法和嵌入层做权重衰退，而 bias 和层归一化的参数不做衰退
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    # 统计两种参数各自的个数并打印
+    ...
+    # 使用 fused AdamW 即使用 cuda 内核融合后的优化器
+    # 自动检测是否能使用 fused
+    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and 'cuda' in device
+    print(f"using fused AdamW: {use_fused}")
+    # 指定优化器并返回
+    optimizer = torch.optim.AdamW(optim_groups, 
+                                lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+    return optimizer
+```
+
+因为需要较大幅度自定义优化器，这里用一个函数辅助进行。
+
+实现两个主要功能：
+- 对所有需要梯度的 2D 模型参数进行权重衰退
+- 如果支持 cuda，使用内核融合后的优化器进行加速，即 fused AdamW
+
+分别对应两个 torch 规定的用法：
+- 在优化器初始化时，使用**字典列表**对模型参数进行分组指定。
+- 使用 fused AdamW 的标准流程（先自动检测是否可用，再在优化器初始化时指定）
+
