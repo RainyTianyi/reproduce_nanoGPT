@@ -192,6 +192,41 @@ for param_group in optimizer.param_groups:
 
 ---
 
+```python
+# 先进行一些数值计算，得到需要多少组梯度进行累加
+total_batch_size = 524288   # 2**19，~0.5M，单位为 tokens。0.5M 和论文一致
+B = 2   # 单个设备支持的 Batch_size，单位为 seqs
+T = 1024    # 序列长度，GPT2 用 1024，GPT3 用 2048
+assert total_batch_size % (B * T) == 0
+grad_accum_steps = total_batch_size // (B * T)
+
+...
+
+for step in range(max_steps):
+    ...
+    loss_accum = 0.0    # 统计总损失，用于打印信息
+    # 用小循环实现梯度累加。每个 micro_step 是设备实际一次并行计算。
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # 在计算过程中，进一步使用 BF16 来减少内存开销和数据传输开销
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # 注意！这里需要重新计算平均值，因为 torch 对每个 micro_step 的反向传播只做了累加。
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+    ...
+```
+
+梯度累加，**是在单个设备上，多次使用不同数据进行前向传播，多次计算反向传播后对梯度进行求和（对各个参数单独，torch 的 backward 默认逻辑就是累加）后，再进行参数更新（即优化器步）**。
+
+也就是实际达到的效果等价于**使用了一个大批量**，使得每个 step 能够和论文中的大批量达到统一。即对于外层 step 看，使用了一个很大的批量；对于内层 micro_step，则是考虑单个设备的计算内存限制后，实际进行的多次并行计算。
+
+这一步过后整个模型与 GPT 基本一致，只是每一步的训练时间很长。因为是多个 micro_step 的累加，多个 **micro_step 因设备限制，相互是串行的**。只有 micro_step 内部是并行的。
+
+---
+
 ## Class GPT
 
 ```python

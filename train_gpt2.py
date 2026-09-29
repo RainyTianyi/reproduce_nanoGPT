@@ -299,8 +299,18 @@ model.to(device)
 # 使用 torch 提供的神经网络专用编译器
 model = torch.compile(model)
 
+# 使用梯度累加，实现和 GPT 论文中同样大小的 batch
+# 先进行一些数值计算，得到需要多少组梯度进行累加
+total_batch_size = 524288   # 2**19，~0.5M，单位为 tokens。0.5M 和论文一致
+B = 2   # 单个设备支持的 Batch_size，单位为 seqs
+T = 1024    # 序列长度，GPT2 用 1024，GPT3 用 2048
+assert total_batch_size % (B * T) == 0
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
 # 创建数据加载器实例
-train_loader = DataLoaderLite(B=2, T=1024)
+train_loader = DataLoaderLite(B=B, T=T)
 
 # 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
 torch.set_float32_matmul_precision('high')
@@ -330,16 +340,24 @@ def get_lr(it):
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 # GPT 原文实际训练超过 max_steps 次，但这里先用 max_steps。
+# 这里的一个 step 在使用梯度累加后，达到和 GPT 论文一致，即 0.5M tokens
+# 也就是这里是优化器的 step，设备计算的 step 被放进小循环中。
 for step in range(max_steps):
     t0 = time.time()
     
-    x, y  = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    # 在计算过程中，进一步使用 BF16 来减少内存开销和数据传输开销
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0    # 统计总损失，用于打印信息
+    # 用小循环实现梯度累加。每个 micro_step 是设备实际一次并行计算。
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # 在计算过程中，进一步使用 BF16 来减少内存开销和数据传输开销
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # 注意！这里需要重新计算平均值，因为 torch 对每个 micro_step 的反向传播只做了累加。
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     # 添加梯度裁剪，控制模型优化的速度。函数返回裁剪前的梯度向量范数
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # 使用学习率调度器
@@ -351,9 +369,9 @@ for step in range(max_steps):
     torch.cuda.synchronize()    # 等待 GPU 计算完成
     t1 = time.time()
     dt = t1 - t0
-    tokens_processed = train_loader.B * train_loader.T
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
     tokens_per_sec = tokens_processed / dt
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     
 import sys; sys.exit(0)
 
