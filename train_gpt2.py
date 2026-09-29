@@ -301,7 +301,7 @@ model = torch.compile(model)
 
 # 使用梯度累加，实现和 GPT 论文中同样大小的 batch
 # 先进行一些数值计算，得到需要多少组梯度进行累加
-total_batch_size = 524288   # 2**19，~0.5M，单位为 tokens。0.5M 和论文一致
+total_batch_size = 16384   # 2**19，524288，~0.5M，单位为 tokens。0.5M 和论文一致
 B = 2   # 单个设备支持的 Batch_size，单位为 seqs
 T = 1024    # 序列长度，GPT2 用 1024，GPT3 用 2048
 assert total_batch_size % (B * T) == 0
@@ -319,7 +319,7 @@ torch.set_float32_matmul_precision('high')
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
-max_steps = 50
+max_steps = 20  # 临时改动，用于训练
 # 根据训练步数推进，改变学习率
 def get_lr(it):
     # 线性 warmup
