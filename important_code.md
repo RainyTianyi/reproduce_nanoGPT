@@ -223,9 +223,89 @@ for step in range(max_steps):
 
 也就是实际达到的效果等价于**使用了一个大批量**，使得每个 step 能够和论文中的大批量达到统一。即对于外层 step 看，使用了一个很大的批量；对于内层 micro_step，则是考虑单个设备的计算内存限制后，实际进行的多次并行计算。
 
+这里注意一个细节，`loss = loss / grad_accum_steps`。torch 的损失函数默认 reduction=mean，即以平均值作为损失函数。这在梯度累加之前没有问题，但引入梯度累加之后，**不同 micro_step 虽然内部计算了平均值，但在累加时并没有计算平均而是直接相加**，造成总的损失函数比一个大 batch 的损失函数计算结果偏大。因此这里需要除 micro_steps 的数量，用以达到平均值。 
+
 这一步过后整个模型与 GPT 基本一致，只是每一步的训练时间很长。因为是多个 micro_step 的累加，多个 **micro_step 因设备限制，相互是串行的**。只有 micro_step 内部是并行的。
 
 ---
+
+下一步需要引入 DDP，即 DistributedDataParallel 分布式数据并行。最关键的是从多进程的角度考虑多卡数据并行。
+
+实际上就是把一个单进程程序修改为一个多进程程序的过程（所有进程跑同一份程序）。除了添加 DDP 需要的代码之外，还需要注意
+- 在终端中**使用 torchrun 命令**而不是 python 命令运行程序
+- 如何实现**数据并行**（不同卡跑不同数据的 forward backward）
+- 在何处进行**进程通信**（即多卡之间同步梯度信息和模型）
+- 只在主进程**打印信息**（打印占用 GPU-CPU 通信，耗时）
+- 运行完成后需要手动**回收进程**
+多卡数据并行，**本质上还是为了构建一个大的 batch**，也就是把梯度累加的 micro_step 放到不同卡上并行，减少总运行时间。所以还需要调整 grad_accum_steps 计算相关的代码。
+
+### DDP 相关的初始化
+
+主要处理 torchrun 运行引入的环境变量，需要读取进系统内存中，用于后续操作设备。
+
+```python
+# torchrun 命令会自动设置环境变量 RANK, LOCAL_RANK, 和 WORLD_SIZE
+# 从这里开始，要想象有 ddp_world_size 个进程，同时运行整个代码
+ddp = int(os.environ.get('RANK', -1)) != -1 # 检测是否使用了 torchrun
+if ddp:
+    # 使用 DDP 依赖于 cuda。这里需要设置这些设备，与 torchrun 生成的保持一致
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])  # 全局的进程编号
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])  # 本主机中的进程编号
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # 设置主进程，用于打印日志，设置 checkpoint 等等
+
+...
+# 如果需要使用 ddp，需要把模型进行类型转换
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+# 保存一份未转换类型的模型，用于初始化优化器
+raw_model = model.module if ddp else model
+```
+
+### 对 DataLoader 的修改
+
+主要处理如何实现数据并行的问题。
+
+```python
+# 需要用于返回数据，能够处理 DDP 开启时的多卡不同数据生成
+def __init__(self, B, T, process_rank, num_processes):
+    ...
+    # 记录当前读到哪个 batch
+    self.cur_pos = self.B * self.T * self.process_rank
+
+def next_batch(self):
+    ...
+    # 更新当前位置
+    self.cur_pos += B * T * self.num_processes
+    # 如果下一个 Batch 对应的 buf 数据超过 tokens 边界，重置
+    if self.cur_pos + B * T * self.num_processes + 1 > len(self.tokens):
+        self.cur_pos = self.B * self.T * self.process_rank
+    return x, y
+```
+
+### 对训练代码的修改
+
+主要处理在何处进行进程通信的问题。相关解释可以看 AIQA。
+
+```python
+for step in range(max_steps):
+    ...
+    for micro_step in range(grad_accum_steps):
+        ...
+        # 使用 DDP 时，需要在最后一个 micro_step 进行多卡同步梯度
+        # 所以必须在反向传播前声明需要同步
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        loss.backward()
+    # loss_accum 只保存了本进程的值，因此也需要额外同步
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    ...
+```
 
 ## Class GPT
 
@@ -266,4 +346,6 @@ def configure_optimizers(self, weight_decay, learning_rate, device):
 分别对应两个 torch 规定的用法：
 - 在优化器初始化时，使用**字典列表**对模型参数进行分组指定。
 - 使用 fused AdamW 的标准流程（先自动检测是否可用，再在优化器初始化时指定）
+
+## Class DataLoaderLite
 

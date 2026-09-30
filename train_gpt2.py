@@ -1,4 +1,6 @@
+import os
 import math
+import time
 import inspect
 from dataclasses import dataclass
 import torch
@@ -231,13 +233,16 @@ class GPT(nn.Module):
         # 统计两种参数各自的个数并打印
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # 只在主进程打印信息
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # 使用 fused AdamW 即使用 cuda 内核融合后的优化器
         # 自动检测是否能使用 fused
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and 'cuda' in device
-        print(f"using fused AdamW: {use_fused}")
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         # 指定优化器并返回
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
@@ -247,9 +252,12 @@ import tiktoken
 
 # 训练数据生成 这里使用顺序固定点采样
 class DataLoaderLite:
-    def __init__(self, B, T):
+    # 需要用于返回数据，能够处理 DDP 开启时的多卡不同数据生成
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank    # 运行进程的编号，用于差异化返回数据
+        self.num_processes = num_processes  # 总共有多少进程并行，用于每次步进
         
         # 读出磁盘数据到内存中
         with open('input.txt', 'r') as f:
@@ -258,11 +266,11 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
         # 输出总 token 数以及一个 epoch 含多少个 batch
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        if master_process:
+            print(f"loaded {len(self.tokens)} tokens")
         
         # 记录当前读到哪个 batch
-        self.cur_pos = 0
+        self.cur_pos = self.B * self.T * self.process_rank
         
     def next_batch(self):
         B, T = self.B, self.T
@@ -272,45 +280,84 @@ class DataLoaderLite:
         x = (buf[:-1]).reshape(B, T)
         y = (buf[1:]).reshape(B, T)
         # 更新当前位置
-        self.cur_pos += B * T
+        self.cur_pos += B * T * self.num_processes
         # 如果下一个 Batch 对应的 buf 数据超过 tokens 边界，重置
-        if self.cur_pos + B * T + 1 > len(self.tokens):
-            self.cur_pos = 0
+        if self.cur_pos + B * T * self.num_processes + 1 > len(self.tokens):
+            self.cur_pos = self.B * self.T * self.process_rank
         return x, y
     
 # -----------------------------------------------------------------------------
-import time
+# 数据并行初始化
+"""
+使用 torch 提供的多卡并行 DistributedDataParallel(DDP) 进行训练
+运行无 DDP 版本（单卡）时：
+python train_gpt2.py
+运行 DDP 版本（多卡，以 8 卡为例）时：
+torchrun --standalone --nproc_per_node=8 train_gpt2.py
+AutoDL 运行前还需要：
+unset OMP_NUM_THREADS
+"""
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-# 自动检测设备
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
+# torchrun 命令会自动设置环境变量 RANK, LOCAL_RANK, 和 WORLD_SIZE
+# 从这里开始，要想象有 ddp_world_size 个进程，同时运行整个代码
+ddp = int(os.environ.get('RANK', -1)) != -1 # 检测是否使用了 torchrun
+if ddp:
+    # 使用 DDP 依赖于 cuda。这里需要设置这些设备，与 torchrun 生成的保持一致
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])  # 全局编号
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])  # 本机编号
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # 设置主进程，用于打印日志，设置 checkpoint 等等
+else:
+    # 将 DDP 变量设置为单卡，用于给后续提供统一的输入参数格式
+    # 单卡时相当于就是主进程
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # 自动检测设备
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 # 设置初始化的随机种子
 torch.manual_seed(1337)
-torch.cuda.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # 使用 torch 提供的神经网络专用编译器
 model = torch.compile(model)
+# 如果需要使用 ddp，需要把模型进行类型转换
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+# 保存一份未转换类型的模型，用于初始化优化器
+raw_model = model.module if ddp else model
 
 # 使用梯度累加，实现和 GPT 论文中同样大小的 batch
 # 先进行一些数值计算，得到需要多少组梯度进行累加
-total_batch_size = 16384   # 2**19，524288，~0.5M，单位为 tokens。0.5M 和论文一致
-B = 2   # 单个设备支持的 Batch_size，单位为 seqs
+total_batch_size = 524288   # 2**19，524288，~0.5M，单位为 tokens。0.5M 和论文一致
+B = 16   # 单个设备支持的 Batch_size，单位为 seqs
 T = 1024    # 序列长度，GPT2 用 1024，GPT3 用 2048
-assert total_batch_size % (B * T) == 0
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 # 创建数据加载器实例
-train_loader = DataLoaderLite(B=B, T=T)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 # 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
 torch.set_float32_matmul_precision('high')
@@ -319,7 +366,7 @@ torch.set_float32_matmul_precision('high')
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
-max_steps = 20  # 临时改动，用于训练
+max_steps = 50
 # 根据训练步数推进，改变学习率
 def get_lr(it):
     # 线性 warmup
@@ -337,7 +384,7 @@ def get_lr(it):
 
 # 使用优化器进行模型训练
 # 按照 GPT3 论文设置超参数
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 # GPT 原文实际训练超过 max_steps 次，但这里先用 max_steps。
 # 这里的一个 step 在使用梯度累加后，达到和 GPT 论文一致，即 0.5M tokens
@@ -357,7 +404,14 @@ for step in range(max_steps):
         # 注意！这里需要重新计算平均值，因为 torch 对每个 micro_step 的反向传播只做了累加。
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        # 使用 DDP 时，需要在最后一个 micro_step 进行多卡同步梯度
+        # 所以必须在反向传播前声明需要同步
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
+    # loss_accum 只保存了本进程的值，因此也需要额外同步
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     # 添加梯度裁剪，控制模型优化的速度。函数返回裁剪前的梯度向量范数
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # 使用学习率调度器
@@ -369,10 +423,15 @@ for step in range(max_steps):
     torch.cuda.synchronize()    # 等待 GPU 计算完成
     t1 = time.time()
     dt = t1 - t0
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
-    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-    
+    if master_process:    
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+
+# 释放进程
+if ddp:
+    destroy_process_group()
+
 import sys; sys.exit(0)
 
 # 使用训练好的模型进行预测
