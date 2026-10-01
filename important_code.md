@@ -349,3 +349,46 @@ def configure_optimizers(self, weight_decay, learning_rate, device):
 
 ## fineweb.py
 
+### 下载数据
+
+```python
+# 下载数据集
+fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
+```
+
+用 huggingface 提供的 datasets 类型下载并加载数据。有关于这个函数的使用方式，以及返回类型的数据结构、内存特点，还有怎么加载本地下载好的有标准格式化的数据集，参考 AIQA 中的相关部分。
+
+### 处理数据
+
+```python
+eot = enc._special_tokens['<|endoftext|>']  # 获得特殊词元索引
+def tokenize(doc):
+    # 词元化一个文档并返回 numpy 数组
+    tokens = [eot]  # eot 实际上被设计为在每个文档的开头
+    tokens.extend(enc.encode_ordinary(doc["text"]))
+    ...
+```
+
+填充特殊词元，以及取出文本（即上面的 fw 迭代器指向的字典数据对象的 text 值）并做词元化。
+
+---
+
+**在 python 程序中，要实现真正的并行，必须用多进程**。
+
+因为 Python 有 GIL，CPU 密集型任务用多进程才能真正并行。Global Interpreter Lock，全局解释器锁，作用是保证**同一时刻，一个 Python 进程里只有一个线程能执行 Python 字节码**。
+
+```python
+# 用 CPU 多进程处理所有文档并保存
+nprocs = max(1, os.cpu_count() // 2)
+with mp.Pool(nprocs) as pool:
+    ...
+    for tokens in pool.imap(tokenize, fw, chunksize=16):
+```
+
+imap 是多进程中的**调度器 + 数据收集器**。这里需要注意的是，和之前的 DDP 不同，主代码只在主进程中执行，进程池中的进程只运行调度器给的函数。
+
+nprocs 指定需要使用的进程（CPU 核心）数量。with 在主进程中维护进程池，由 imap 分发任务给各个进程（函数，数据迭代器，一次发的数据数量），运行完后**按照顺序返回**，使得主进程中能够用 for 循环遍历各个进程的返回值。
+
+对于其他任务，存在可能更加高效的无序返回的调度器 imap_unordered。本任务不能使用，否则文本序列的连续性将被破坏。
+
+有关多进程编码逻辑的细节，参考 AIQA 的相关部分。Windows 直接这样使用进程池有 bug，参考 debug_log 相关部分。

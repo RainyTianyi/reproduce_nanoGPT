@@ -712,3 +712,138 @@ if token_count != 0:
 
 这样做的目的：把巨大的数据集切成大小均匀的块，方便后续训练时按块加载，同时利用多核加速分词，减少等待时间。文件操作只是简单的二进制保存，不需要手动管理文件句柄，`np.save` 会处理好一切。
 
+## load_dataset() 函数相关
+
+### 函数怎么用？返回值是什么？
+
+你给出的这行代码是使用 Hugging Face `datasets` 库加载 `HuggingFaceFW/fineweb-edu` 数据集的典型用法。下面我为你详细解释它的用法和返回值。
+
+#### `load_dataset` 函数怎么用？
+
+`load_dataset()` 是 Hugging Face `datasets` 库的核心函数，用于从 Hugging Face Hub 或本地文件加载数据集。
+
+你代码中的参数含义如下：
+
+*   **`"HuggingFaceFW/fineweb-edu"`**：这是数据集的唯一标识符，格式为 `用户名/数据集名`。它告诉函数去 Hugging Face Hub 上加载 `HuggingFaceFW` 这个组织发布的 `fineweb-edu` 数据集。
+*   **`name=remote_name`**：`name` 参数用于指定数据集的**配置名称（configuration name）**。`fineweb-edu` 数据集提供了多个不同规模的子集（配置），例如 `sample-10BT`（约100亿个token的采样）、`sample-100BT` 等。`remote_name` 是一个变量，它的值决定了你要加载哪个具体的数据集版本。
+*   **`split="train"`**：`split` 参数用于指定加载数据集的哪个划分（如 `train`、`test`、`validation`）。这里指定加载**训练集**。如果你不指定这个参数，函数会返回一个包含所有划分的 `DatasetDict` 对象。
+
+#### 返回的 `fw` 是什么？
+
+`fw` 是 `load_dataset()` 函数的返回值，它是一个 **`Dataset` 对象**（或者当设置 `streaming=True` 时，是一个 `IterableDataset` 对象）。
+
+##### 1. `Dataset` 对象（默认情况）
+
+当你没有设置 `streaming=True` 时，`load_dataset` 会返回一个常规的 `Dataset` 对象。它的主要特点包括：
+
+*   **内存映射**：`Dataset` 对象基于 Apache Arrow 格式，支持内存映射（memory-mapping）。这意味着即使数据集很大（如 FineWeb-Edu 的10B子集），它也不会一次性全部加载到内存中，而是按需从磁盘读取，从而节省内存。
+*   **快速随机访问**：你可以像操作 Python 列表一样，通过索引快速访问任意一行数据。例如：
+    ```python
+    # 获取第一行数据（返回一个字典）
+    first_row = fw[0]
+    # 获取 "text" 列的所有数据（返回一个列表）
+    all_texts = fw["text"]
+    # 获取第一行的 "text" 字段
+    first_text = fw[0]["text"]
+    ```
+    这正是你在示例代码中看到 `doc["text"]` 这种用法的原因。
+*   **支持切片**：你可以使用切片来获取数据子集，例如 `fw[0:100]` 会返回一个新的 `Dataset` 对象，包含前100条数据。
+
+##### 2. `IterableDataset` 对象（流式模式）
+
+如果你在 `load_dataset` 中设置了 `streaming=True`，函数会返回一个 `IterableDataset` 对象。这对于那些大到无法下载到本地磁盘的数据集非常有用。
+
+*   **无需完整下载**：数据会随着你的迭代过程逐步从远程流式加载，不需要等待整个数据集下载完成。
+*   **只能顺序迭代**：`IterableDataset` 支持 `for` 循环遍历，但不能随机访问（如 `fw[0]`）。你只能用 `for example in fw:` 的方式逐条处理数据。
+
+#### 关于 `fineweb-edu` 数据集
+
+`HuggingFaceFW/fineweb-edu` 是 Hugging Face 团队发布的一个大规模英文教育类文本数据集。它是对 `FineWeb` 数据集的子集，使用 Llama-3-70B-Instruct 模型进行教育内容分类和过滤，最终形成了包含 **1.3 万亿个 token** 的教育类文本语料库。它非常适合用于大语言模型的预训练。
+
+### 数据集标识符有哪些种类？
+
+`load_dataset()` 的第一个参数 `path` 决定了数据的来源，它支持以下几种类型：
+
+#### 1. 从 Hugging Face Hub 加载
+这是最常用的方式，只需提供数据集的**仓库标识符**即可。
+- **格式**：`"用户名/数据集名"` 或 `"组织名/数据集名"`。
+- **示例**：`load_dataset("lhoestq/demo1")`
+- **版本控制**：可以使用 `revision` 参数指定 Git 标签、分支或提交哈希来加载特定版本。
+- **指定配置**：使用 `name` 参数指定数据集的配置（configuration），例如 `load_dataset("nyu-mll/glue", "sst2")`。
+
+#### 2. 加载本地数据集
+对于已经下载到本地的数据，`load_dataset()` 同样支持，但需要根据数据格式指定**加载脚本名**（如 `"csv"`、`"json"`），并通过 `data_files` 参数指定文件路径。
+
+**支持的主流本地格式及加载方式**：
+
+| 数据格式 | 加载脚本 | 示例代码 |
+| :--- | :--- | :--- |
+| **CSV / TSV** | `"csv"` | `load_dataset("csv", data_files="my_file.csv")` |
+| **JSON / JSON Lines** | `"json"` | `load_dataset("json", data_files="my_file.jsonl")` |
+| **文本文件** | `"text"` | `load_dataset("text", data_files="my_file.txt")` |
+| **Parquet** | `"parquet"` | `load_dataset("parquet", data_files="my_file.parquet")` |
+| **Arrow** | `"arrow"` | `load_dataset("arrow", data_files="my_file.arrow")` |
+| **Pandas DataFrame** | `"pandas"` | `load_dataset("pandas", data_files="my_dataframe.pkl")` |
+
+> **提示**：如果本地目录中只包含数据文件，也可以直接将目录路径作为 `path` 传入，`load_dataset()` 会自动推断格式并加载。
+
+#### 3. 从内存数据结构加载
+你可以使用 `Dataset.from_dict()` 或 `Dataset.from_pandas()` 等方法，直接从 Python 字典或 Pandas DataFrame 创建 `Dataset` 对象，无需先保存为文件。
+
+#### 4. 其他来源
+- **远程文件**：`data_files` 参数也支持 HTTP/HTTPS URL，可以直接加载远程文件。
+- **Hugging Face Storage Bucket**：使用 `buckets/` 前缀的路径从存储桶加载。
+
+---
+
+### `Dataset` 对象的数据结构
+
+`Dataset` 对象类似于一个**增强版的表格**，其内部结构基于 Apache Arrow 格式，这使得它能够高效处理大规模数据，并支持内存映射（memory-mapping），从而在加载大数据集时仅占用少量内存。
+
+#### 核心属性
+你可以通过以下属性快速了解数据集的结构：
+
+| 属性 | 说明 | 示例 |
+| :--- | :--- | :--- |
+| `dataset.column_names` | 所有列（字段）的名称 | `['text', 'label']` |
+| `dataset.features` | 列的特征类型定义 | `{'text': Value('string'), 'label': Value('int64')}` |
+| `dataset.num_rows` | 样本总数 | `1000` |
+| `dataset.shape` | 形状（行数，列数） | `(1000, 2)` |
+
+#### 数据访问方式
+- **按行索引**：返回一个字典，代表一行数据。例如 `dataset[0]` 返回 `{'text': '...', 'label': 1}`。
+- **按列名索引**：返回该列所有值的列表。例如 `dataset["text"]` 返回所有文本的列表。
+- **切片**：`dataset[0:100]` 返回一个新的 `Dataset` 对象，包含前100行。
+
+#### 特征类型（Features）
+`features` 属性定义了每一列的数据类型，常见的特征类型包括：
+- **`Value`**：单一数据类型，如 `int64`、`float32`、`string` 等。
+- **`ClassLabel`**：预定义的分类标签，在数据集中以整数存储，但可以映射回标签名。
+- **`Sequence`**：用于表示列表或嵌套结构。例如 `Sequence(Value("int8"))` 表示一个整数列表。
+- **`Image` / `Audio`**：用于存储图像或音频数据，访问时会返回 PIL 对象或音频数组。
+
+#### 数据集字典（DatasetDict）
+当你没有指定 `split` 参数时，`load_dataset()` 会返回一个 `DatasetDict` 对象。它本质上是一个字典，键是划分名称（如 `"train"`、`"test"`），值是对应的 `Dataset` 对象。
+
+```python
+DatasetDict({
+    train: Dataset({ features: ['label', 'text'], num_rows: 3600000 }),
+    test: Dataset({ features: ['label', 'text'], num_rows: 400000 })
+})
+```
+
+你可以通过 `dataset_dict["train"]` 来访问特定的划分。
+
+#### 常用操作方法
+`Dataset` 对象提供了丰富的方法来转换和处理数据，例如：
+- **`map(function)`**：对每一行应用函数，用于批量处理或特征工程。
+- **`filter(function)`**：按条件过滤样本。
+- **`select(indices)`**：按索引选择样本。
+- **`train_test_split()`**：拆分训练集与测试集。
+- **`shuffle(seed)`**：随机打乱数据集。
+- **`remove_columns(columns)`** / **`rename_column(old, new)`**：删除或重命名列。
+- **`with_format("torch")`**：转换为深度学习框架格式。
+- **`to_pandas()`** / **`to_csv()`**：转换为 Pandas DataFrame 或保存为 CSV。
+- **`save_to_disk()`** / **`load_from_disk()`**：本地存储与加载。
+
+总结来说，`Dataset` 对象是一个功能强大的、列式存储的数据容器，其设计兼顾了易用性与处理大规模数据集的效率。
