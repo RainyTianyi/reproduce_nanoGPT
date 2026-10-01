@@ -1,4 +1,4 @@
-# 改为使用TF32计算矩阵乘法时，训练速度问题
+# 改为使用TF32计算矩阵乘法时，训练速度异常慢
 
 ## 问题
 
@@ -166,4 +166,122 @@ step 7, loss: 7.980915069580078, dt: 399.56ms, tok/sec: 5125.61
 3. **B=2 时 TF32 带来的提升已经很不明显**（约 12% ），且对于训练来说太小了，不利于模型学习。需要进一步优化内存占用尽可能提高 B。
    
 
-# 问题
+# 使用 AutoDL 运行 fineweb.py 下载数据集失败
+
+## 问题
+
+根源在于国内网络无法直接访问 huggingface.co，虽然 autoDL 提供学术资源加速，但有时网络不稳定。这种不稳定给大数据集下载带来很大的挑战。因此更**建议不使用学术资源加速**（终端中用 `unset http_proxy && unset https_proxy` 取消之前的加速设置），**同时使用镜像站** hf-mirror.com 作为上游地址下载。
+
+同时，如果不加速使用镜像站仍然无法下载，**优先考虑是服务器的问题**。**换一个地区**创建一个基本相同的实例，进去后按如下顺序操作：
+1. **用学术资源加速**，用 pip 配置好依赖库。
+2. **取消加速**后，运行 `ping hf-mirror.com` 检查连接情况。丢包率几乎为 0 则考虑运行下载程序。
+3. 在 `/root/autodl-temp` 50GB 数据盘中运行数据下载程序。
+
+以 fineweb.py 为例，正常在**半分钟内**会出现 parquet 文件的下载进度条。输出为：
+
+```
+root@autodl-container-af19428472-ab36e92a:~/autodl-tmp# python fineweb.py
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+README.md: 100%|███████████████████████| 26.4k/26.4k [00:00<00:00, 56.3kB/s]
+Resolving data files: 100%|███████████████████████| 2410/2410 [00:00<00:00, 20148.85it/s]
+000_00000.parquet: 100%|███████████████████████| 2.15G/2.15G [02:06<00:00, 17.0MB/s]
+001_00000.parquet: 100%|███████████████████████| 2.15G/2.15G [02:06<00:00, 17.0MB/s]                         
+```
+
+这个 warning 可以通过去 huggingface.co 注册账号，创建只读 token，运行下载程序前 `export` 环境变量解决。一般用于在 huggingface.co 下载数据集时为了加速而使用。暂时未确认同样的操作对镜像站是否有效。
+
+## 实验
+
+### 终端运行程序后，长时间未出现进度条和下载速度
+
+首先，如果 fineweb.py 不做任何调整（默认去连接 huggingface.co），在终端运行 `source /etc/network_turbo` 后，如果无法连接服务器，可以去**实例监控**观察到如下现象：
+
+**终端长时间没有输出，但使用内存一直在线性增长**。增长到约 20G 时，会出现重连提示。
+
+这种现象是运行多进程时，调用 huggingface 的数据库类下载器导致的。如果切换回单进程程序，重连提示很快就会显示。占用内存不断增长是保留日志，不断重复尝试重连导致的。正常运行下载程序时，内存占用不大。（但 fineweb.py 集成了处理程序，多进程的处理程序需要较大的内存，后续观察需要约 8G，因此**对于一切集成下载和处理的程序，不建议在无卡模式运行**）
+
+### 进程被 killed
+
+一般在**无卡模式**运行时容易碰上。无卡模式会使用 `0.5核；2GB内存；无GPU卡 的配置`，价格统一为￥0.1/小时。当网络连接不佳时，不断重复尝试重连导致内存占用增加，触及限制时进程就会被操作系统杀死。
+
+验证方式为同实例用正常模式开机，用同样的网络配置运行程序，出现上一点中 **终端长时间没有输出，但使用内存一直在线性增长** 的现象。即本质上仍是网络问题。
+
+## 解决方式
+
+**确认网络不佳时积极换实例所在地区**！本次的问题是从 西北B区 换到 重庆A区 得到解决的。
+
+在使用 hugging_face 数据集时，python 下载程序头要这样设置：
+
+```python
+import os
+
+# 可选，需要注册账号并获取只读 token
+os.environ["HF_TOKEN"] = "hf_mytoken"
+# 指定国内镜像站
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 缓存重定向为文件存储区，不占用系统盘和数据盘
+os.environ["HF_HOME"] = "/root/autodl-fs/hf_cache_fineweb/"
+```
+
+## 结论
+
+1. 运行某个下载程序前，先**配网络环境并确认网络通畅**。确认能 ping 到下载地址，丢包率接近 0 之后再运行下载程序。
+2. 尽量**分开数据集下载程序和处理程序**。因为处理往往需要较多内存，而下载不用。下载程序单独出来更好 debug（更容易发现网络问题），同时能使用无卡模式下载，省钱。
+3. **确认网络不佳时积极换实例所在地区**。
+4. **不建议本地下载好数据集后再上传**，不用网盘服务的话速度很慢。
+
+另外，hugging face 的 dataset 类提供的 load_dataset 方法同时支持云端下载和本地下载好的数据集。使用时可以留意，选择适合的方式使用。
+
+# Windows 系统运行 fineweb.py 处理数据集异常现象
+
+## 问题
+
+在 Windows 系统单独下载好数据集后，使用多进程处理程序进行处理。**运行期间内存使用快速增长，且出现 RunTimeError 但终端仍在持续输出和运行**，时不时弹出进度条和一段 RunTimeError 报错。
+
+## 原理
+
+经典 **Windows 下 Python 多进程（multiprocessing）** 报错。
+
+在 Linux/Mac 上，Python 多进程默认使用 `fork`，子进程会自动继承主进程的内存状态。
+但在 **Windows** 上，Python 必须使用 `spawn` 方式启动子进程，子进程会**重新导入（import）并执行主脚本**。
+
+如果在脚本最外层（缩进为 0 的地方）直接写了 `with mp.Pool(...)`，子进程在导入脚本时又会执行到这行代码，试图再创建子进程，形成**无限递归**，Python 为了保护系统就会抛出这个 `RuntimeError`。
+
+## 解决方案
+
+需要把**创建进程池及后续的处理代码**全部放进 `if __name__ == '__main__':` 保护块内。
+
+`d:\github\reproduce_nanoGPT\fineweb.py`，第 56 行左右的代码，按照下面结构修改：
+
+**修改前：**
+```python
+# ... 前面的导入和变量定义 ...
+nprocs = max(1, os.cpu_count() // 2)
+with mp.Pool(nprocs) as pool:
+    # ... 具体的数据处理逻辑 ...
+```
+
+**修改后（正确写法）：**
+```python
+import multiprocessing as mp
+
+# ... 前面的导入和变量定义 ...
+
+def main():
+    # 把原本第 56 行及之后的代码全部缩进放进这个函数里
+    nprocs = max(1, os.cpu_count() // 2)
+    with mp.Pool(nprocs) as pool:
+        # ... 原本的数据处理逻辑 ...
+        pass
+
+if __name__ == '__main__':
+    # Windows 下多进程必须加这句，官方推荐的启动保护
+    mp.freeze_support() 
+    main()
+```
+
+> **注意**：不仅仅是 `with mp.Pool` 这一句，**所有依赖这个进程池进行处理的代码（比如 `pool.imap`, `pool.map` 等）都必须放在 `if __name__ == '__main__':` 下面**。否则依然会报错。
+
+### 补充注意
+1. **不要用 Jupyter Notebook 运行**：这种使用 `multiprocessing` 的脚本（特别是 `fineweb.py`）必须在命令行终端（PowerShell / CMD）里用 `python fineweb.py` 运行，在 Jupyter 里跑通常会卡死。
+2. **如果修改后还是卡住**：在 Windows 上，`nprocs` 设置得太大有时会导致内存爆满而卡死。可以在代码里硬编码把 `nprocs = 4` 试试。

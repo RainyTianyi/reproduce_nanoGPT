@@ -347,5 +347,5 @@ def configure_optimizers(self, weight_decay, learning_rate, device):
 - 在优化器初始化时，使用**字典列表**对模型参数进行分组指定。
 - 使用 fused AdamW 的标准流程（先自动检测是否可用，再在优化器初始化时指定）
 
-## Class DataLoaderLite
+## fineweb.py
 
