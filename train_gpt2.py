@@ -29,10 +29,13 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # V 输出投影层
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        """
+        # 使用 FlashAttention 后，不需要手动进行因果掩码
         # "bias" 用于 masked 注意力权重（解码器需要屏蔽序列后方信息）
         # 使用 register_buffer 注册模型张量，但不可学习
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .reshape(1, 1, config.block_size, config.block_size))
+        """
         # 记录 head 和 embd 数量，用于 forward 时做多头注意力
         self.n_head = config.n_head
         self.n_embd = config.n_embd
