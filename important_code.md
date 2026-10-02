@@ -392,3 +392,40 @@ nprocs 指定需要使用的进程（CPU 核心）数量。with 在主进程中�
 对于其他任务，存在可能更加高效的无序返回的调度器 imap_unordered。本任务不能使用，否则文本序列的连续性将被破坏。
 
 有关多进程编码逻辑的细节，参考 AIQA 的相关部分。Windows 直接这样使用进程池有 bug，参考 debug_log 相关部分。
+
+## Class DataLoaderLite
+
+将数据加载器读取数据的来源切换为 fineweb.py 处理得到的数据。需要新增对于切片的处理逻辑。
+
+```python
+class DataLoaderLite:
+    # 需要用于返回数据，能够处理 DDP 开启时的多卡不同数据生成
+    def __init__(self, B, T, process_rank, num_processes, split):
+        ...
+        # 读出磁盘数据到内存中
+        assert split in {'train', 'val'}
+        # 获取切片文件名
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)  # 获取路径下的所有文件名
+        shards = [s for s in shards if split in s]  # 过滤出需要用的文件，区分训练集测试集
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]   # 组合出所有路径
+        self.shards = shards    # 数据路径构成的 List
+        
+        ...
+        # 读取状态，记录当前读到哪个 batch
+        self.cur_shard = 0  # 读到哪个切片
+        self.tokens = load_tokens(self.shards[self.cur_shard])  # 当前切片的完整数据
+        self.cur_pos = self.B * self.T * self.process_rank  # 读到当前切片的哪个 batch
+        
+    def next_batch(self):
+        ...
+        # 更新当前位置
+        self.cur_pos += B * T * self.num_processes
+        # 如果下一个 Batch 对应的 buf 数据超过当前切片的 tokens 边界，重置并进入下一切片
+        if self.cur_pos + B * T * self.num_processes + 1 > len(self.tokens):
+            self.cur_shard = (self.cur_shard + 1) % len(self.shards)    # 循环使用数据
+            self.tokens = load_tokens(self.shards[self.cur_shard])  # 加载新的切片
+            self.cur_pos = self.B * self.T * self.process_rank  # 初始化位置
+        return x, y
+```

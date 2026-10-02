@@ -249,28 +249,44 @@ class GPT(nn.Module):
     
 # -----------------------------------------------------------------------------
 import tiktoken
+import numpy as np
 
+# 从 np 文件中读取数据
+def load_tokens(filename):
+    npt = np.load(filename) # numpy token
+    ptt = torch.tensor(npt, dtype=torch.long)   # pytorch token
+    return ptt
+    
 # 训练数据生成 这里使用顺序固定点采样
+# 修改为使用同目录文件夹下切片好的 FineWeb-Edu-10B Tokens 数据集
 class DataLoaderLite:
     # 需要用于返回数据，能够处理 DDP 开启时的多卡不同数据生成
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank    # 运行进程的编号，用于差异化返回数据
         self.num_processes = num_processes  # 总共有多少进程并行，用于每次步进
         
         # 读出磁盘数据到内存中
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        # 输出总 token 数以及一个 epoch 含多少个 batch
-        if master_process:
-            print(f"loaded {len(self.tokens)} tokens")
+        assert split in {'train', 'val'}
         
-        # 记录当前读到哪个 batch
-        self.cur_pos = self.B * self.T * self.process_rank
+        # 获取切片文件名
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)  # 获取路径下的所有文件名
+        shards = [s for s in shards if split in s]  # 过滤出需要用的文件，区分训练集测试集
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]   # 组合出所有路径
+        self.shards = shards    # 数据路径构成的 List
+        
+        assert len(shards) > 0, f"no shards found for split {split}"
+        # 输出获取到的 split 类型（训练集/测试集）数据的切片文件总个数
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        
+        # 读取状态，记录当前读到哪个 batch
+        self.cur_shard = 0  # 读到哪个切片
+        self.tokens = load_tokens(self.shards[self.cur_shard])  # 当前切片的完整数据
+        self.cur_pos = self.B * self.T * self.process_rank  # 读到当前切片的哪个 batch
         
     def next_batch(self):
         B, T = self.B, self.T
@@ -281,9 +297,11 @@ class DataLoaderLite:
         y = (buf[1:]).reshape(B, T)
         # 更新当前位置
         self.cur_pos += B * T * self.num_processes
-        # 如果下一个 Batch 对应的 buf 数据超过 tokens 边界，重置
+        # 如果下一个 Batch 对应的 buf 数据超过当前切片的 tokens 边界，重置并进入下一切片
         if self.cur_pos + B * T * self.num_processes + 1 > len(self.tokens):
-            self.cur_pos = self.B * self.T * self.process_rank
+            self.cur_shard = (self.cur_shard + 1) % len(self.shards)    # 循环使用数据
+            self.tokens = load_tokens(self.shards[self.cur_shard])  # 加载新的切片
+            self.cur_pos = self.B * self.T * self.process_rank  # 初始化位置
         return x, y
     
 # -----------------------------------------------------------------------------
@@ -357,7 +375,7 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 # 创建数据加载器实例
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 
 # 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
 torch.set_float32_matmul_precision('high')
@@ -365,8 +383,8 @@ torch.set_float32_matmul_precision('high')
 # 学习率调度器（可变学习率函数），按照 GPT3 实现
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715  # 约 375M Tokens
+max_steps = 19073   # 刚好扫一遍数据集 10B Tokens
 # 根据训练步数推进，改变学习率
 def get_lr(it):
     # 线性 warmup
@@ -426,7 +444,7 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:    
-        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 # 释放进程
 if ddp:
