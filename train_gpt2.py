@@ -360,7 +360,9 @@ if torch.cuda.is_available():
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # 使用 torch 提供的神经网络专用编译器
-model = torch.compile(model)
+use_compile = False # 是否使用的开关
+if use_compile:
+    model = torch.compile(model)
 # 如果需要使用 ddp，需要把模型进行类型转换
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -436,6 +438,42 @@ for step in range(max_steps):
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
     
+    # 添加评估的同时，运行模型进行输出。
+    # 这部分代码不支持 torch.compile，会报错
+    if step > 0 and step % 100 == 0 and (not use_compile):
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        # 展开 Batch 维度，并进行重复指定次数
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        # 这里使用独立的随机数生成器，让四个生成的句子不同
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+
+        # 用循环实现逐步前推
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                logits, loss = model(xgen)
+                # 取出最新的输出
+                logits = logits[:, -1, :]   # (B, vocab_size)
+                # 按照概率进行输出（随机取样）
+                probs = F.softmax(logits, dim=-1)   # 获取模型输出的概率值
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)    # 取 topk 概率值
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)   # 按照概率，随机选择 topk 中的索引
+                # 使用 gather 取出索引对应的 vocab_index
+                xcol = torch.gather(topk_indices, -1, ix)
+                # 将输出结果添加到 x 后方，用于继续向后预测
+                xgen = torch.cat((xgen, xcol), dim=-1)
+
+        # 打印模型输出的序列
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist() # 使用 tolist 将张量送回 CPU 并转回标准数据结构
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+    
     # 训练代码
     model.train()
     optimizer.zero_grad()
@@ -477,40 +515,3 @@ for step in range(max_steps):
 # 释放进程
 if ddp:
     destroy_process_group()
-
-import sys; sys.exit(0)
-
-# 使用训练好的模型进行预测
-model.eval()
-num_return_sequences = 5
-max_length = 30
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-# 展开 Batch 维度，并进行重复指定次数
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
-
-# 使用 GPT 进行推理，x (B, T)
-# 统一随机种子便于复现
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-# 用循环实现逐步前推
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        # 取出最新的输出
-        logits = logits[:, -1, :]   # (B, vocab_size)
-        # 按照概率进行输出（随机取样）
-        probs = F.softmax(logits, dim=-1)   # 获取模型输出的概率值
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)    # 取 topk 概率值
-        ix = torch.multinomial(topk_probs, 1)   # 按照概率，随机选择 topk 中的索引
-        # 使用 gather 取出索引对应的 vocab_index
-        xcol = torch.gather(topk_indices, -1, ix)
-        # 将输出结果添加到 x 后方，用于继续向后预测
-        x = torch.cat((x, xcol), dim=-1)
-
-# 打印模型输出的序列
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist() # 使用 tolist 将张量送回 CPU 并转回标准数据结构
-    decoded = enc.decode(tokens)
-    print(">", decoded)
