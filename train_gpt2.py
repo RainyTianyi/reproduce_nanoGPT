@@ -312,8 +312,24 @@ class DataLoaderLite:
 
 # -----------------------------------------------------------------------------
 # 辅助函数，用于 hellaswag 评估
-
-
+# 输入 tokens, mask, 和 logits, 返回模型输出的最小 loss 的标签，作为模型的输出
+def get_most_likely_row(tokens, mask, logits):
+    # 错位处理，使得模型输出的位置和真实数据对齐
+    shift_logits = logits[:, :-1, :]
+    shift_tokens = tokens[:, 1:]
+    # 展平，计算交叉熵损失
+    flat_shift_logits = shift_logits.reshape(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.reshape(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.reshape(tokens.size(0), -1)
+    # 使用掩码，计算关心位置（后续结尾）的平均损失和总损失
+    shift_mask = mask[:, 1:]    # 掩码在 render_example 中只在后续结尾处取 1
+    masked_shift_losses = shift_losses * shift_mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # 根据计算结果，得到模型预测的结果，即取损失最小的后续结尾
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 # -----------------------------------------------------------------------------
 # 数据并行初始化
@@ -420,14 +436,22 @@ def get_lr(it):
 # 按照 GPT3 论文设置超参数
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+# 在训练过程中写入日志，初始化日志
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:
+    pass
+
 # GPT 原文实际训练超过 max_steps 次，但这里先用 max_steps。
 # 这里的一个 step 在使用梯度累加后，达到和 GPT 论文一致，即 0.5M tokens
 # 也就是这里是优化器的 step，设备计算的 step 被放进小循环中。
 for step in range(max_steps):
     t0 = time.time()
+    last_step = (step == max_steps - 1) # 记录最后一个 step 的标签
     
     # 每经过一段时间的训练，进行一次验证集评估
-    if step % 100 == 0:
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -444,10 +468,52 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            # 将打印信息同步写入日志
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}")
+    
+    # 每隔一段时间进行 Hellaswag 评估
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # 注意！需要考虑多进程的情况。
+            # 每个进程只处理 hellaswag 评估中符合互斥条件的数据
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # 从 hellaswag 的函数读取张量验证数据
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # 将数据进行前向传播，获取 logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # 处理完所有验证集数据后，多卡同步
+        if ddp:
+            # 在主进程初始化张量，用于 distributed 的同步操作
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            # 对所有进程进行统一操作
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            # 转回 python 普通数据类型
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        # 计算正确率
+        acc_norm = num_correct_norm / num_total
+        # 在主进程打印信息，并写入日志
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
     
     # 添加评估的同时，运行模型进行输出。
     # 这部分代码不支持 torch.compile，会报错
-    if step > 0 and step % 100 == 0 and (not use_compile):
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -463,7 +529,8 @@ for step in range(max_steps):
         # 用循环实现逐步前推
         while xgen.size(1) < max_length:
             with torch.no_grad():
-                logits, loss = model(xgen)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(xgen) # (B, T, vocab_size)
                 # 取出最新的输出
                 logits = logits[:, -1, :]   # (B, vocab_size)
                 # 按照概率进行输出（随机取样）
@@ -481,7 +548,7 @@ for step in range(max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
     
-    # 训练代码
+    # 训练代码，进行一步优化
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0    # 统计总损失，用于打印信息
@@ -518,6 +585,8 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:    
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 # 释放进程
 if ddp:
