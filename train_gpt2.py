@@ -379,8 +379,8 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-# model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304))
+# model = GPT.from_pretrained('gpt2')
 model.to(device)
 # 使用 torch 提供的神经网络专用编译器
 use_compile = False # 是否使用的开关
@@ -471,7 +471,19 @@ for step in range(max_steps):
             # 将打印信息同步写入日志
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}")
-    
+            # 保存训练过程中的模型
+            if step > 0 and (step % 5000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                # 下面这种保存方式只能使用模型推理，无法继续训练
+                # 如果需要能继续训练的 checkpoint，需要更多信息
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                torch.save(checkpoint, checkpoint_path)
+                
     # 每隔一段时间进行 Hellaswag 评估
     if (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
