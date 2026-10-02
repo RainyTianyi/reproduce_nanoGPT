@@ -282,7 +282,11 @@ class DataLoaderLite:
         # 输出获取到的 split 类型（训练集/测试集）数据的切片文件总个数
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
-        
+            
+        # 初始化读取指针（状态）
+        self.reset()
+    
+    def reset(self):    
         # 读取状态，记录当前读到哪个 batch
         self.cur_shard = 0  # 读到哪个切片
         self.tokens = load_tokens(self.shards[self.cur_shard])  # 当前切片的完整数据
@@ -363,6 +367,8 @@ if ddp:
 # 保存一份未转换类型的模型，用于初始化优化器
 raw_model = model.module if ddp else model
 
+enc = tiktoken.get_encoding("gpt2")
+
 # 使用梯度累加，实现和 GPT 论文中同样大小的 batch
 # 先进行一些数值计算，得到需要多少组梯度进行累加
 total_batch_size = 524288   # 2**19，524288，~0.5M，单位为 tokens。0.5M 和论文一致
@@ -376,6 +382,7 @@ if master_process:
 
 # 创建数据加载器实例
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 # 在矩阵乘法运算中，使用 TF32(19bit) 代替 FP32(32bit)，以精读换速度和显存
 torch.set_float32_matmul_precision('high')
@@ -410,6 +417,27 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 for step in range(max_steps):
     t0 = time.time()
     
+    # 每经过一段时间的训练，进行一次验证集评估
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0    # 用于记录验证集总损失
+            val_loss_steps = 20     # 验证集进行的 micro_step
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / grad_accum_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+    
+    # 训练代码
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0    # 统计总损失，用于打印信息
     # 用小循环实现梯度累加。每个 micro_step 是设备实际一次并行计算。
