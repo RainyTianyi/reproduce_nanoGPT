@@ -1,6 +1,7 @@
 """
 下载并准备 HellaSwag 给出的 LLM 评估数据集
 https://github.com/rowanz/hellaswag
+地址已经失效，使用 Huggingface 下载。并仿照 fineweb 使用镜像源下载。添加了处理 parquet 文件的代码。
 
 Example HellaSwag json item:
 
@@ -29,9 +30,16 @@ HellaSwag 数据集（用于验证、评估等等）总共有 10,042 个样本�
 """
 
 import os
+
+# 指定国内镜像站
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 缓存重定向为文件存储区，不占用系统盘和数据盘
+os.environ["HF_HOME"] = "/root/autodl-fs/hf_cache_fineweb/"
+
 import json
 import requests
 import tiktoken
+import pandas as pd
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -58,32 +66,49 @@ def download_file(url: str, fname: str, chunk_size=1024):
             bar.update(size)
 
 # 数据集下载地址
+# Rowan/hellaswag 在 HF 上的数据文件是 Parquet 格式
+HF_DATASET_BASE = "https://hf-mirror.com/datasets/Rowan/hellaswag/resolve/main/data/"
 hellaswags = {
-    "train": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_train.jsonl",
-    "val": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl",
-    "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
+    "train":      HF_DATASET_BASE + "train-00000-of-00001.parquet",
+    "val":        HF_DATASET_BASE + "validation-00000-of-00001.parquet",
+    "test":       HF_DATASET_BASE + "test-00000-of-00001.parquet",
 }
 
 # GPT 编码器
 enc = tiktoken.get_encoding("gpt2")
 
 def download(split):
-    """在 DATA_CACHE_DIR 处下载数据集"""
-    os.makedirs(DATA_CACHE_DIR, exist_ok=True)  # 创建目录
+    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
     data_url = hellaswags[split]
-    data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
-    if not os.path.exists(data_filename):   # 防止重复下载
-        print(f"Downloading {data_url} to {data_filename}...")
-        download_file(data_url, data_filename)
+    # 注意：现在保存为 .parquet 后缀
+    data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.parquet")
 
-# 读取数据集的迭代器
+    if os.path.exists(data_filename):
+        # 如果文件太小，说明是错误页面，删掉重下
+        if os.path.getsize(data_filename) < 1_000_000:
+            print(f"Removing invalid small file: {data_filename}")
+            os.remove(data_filename)
+        else:
+            print(f"Already have valid {data_filename}, skip download.")
+            return
+
+    print(f"Downloading {data_url} to {data_filename}...")
+    download_file(data_url, data_filename)
+
+    # 下载后再次校验
+    if os.path.getsize(data_filename) < 1_000_000:
+        os.remove(data_filename)
+        raise RuntimeError(f"Downloaded file is too small, likely an error page: {data_url}")
+
 def iterate_examples(split):
-    # 验证集共 10,042 个样本
     download(split)
-    with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
-        for line in f:
-            example = json.loads(line)
-            yield example
+    data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.parquet")
+    df = pd.read_parquet(data_filename)
+    for _, row in df.iterrows():
+        example = row.to_dict()
+        # Parquet 中 label 是字符串，需要转回 int
+        example["label"] = int(example["label"])
+        yield example
 
 def render_example(example):
     """把一条 HellaSwag 样本（一个字典）转换成模型可以批量处理的张量"""

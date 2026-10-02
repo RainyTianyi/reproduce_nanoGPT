@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from hellaswag import render_example, iterate_examples
+
 # 模型参数，使用 dataclass 自动生成类的基本函数，如构造函数等等
 @dataclass
 class GPTConfig:
@@ -307,7 +309,12 @@ class DataLoaderLite:
             self.tokens = load_tokens(self.shards[self.cur_shard])  # 加载新的切片
             self.cur_pos = self.B * self.T * self.process_rank  # 初始化位置
         return x, y
-    
+
+# -----------------------------------------------------------------------------
+# 辅助函数，用于 hellaswag 评估
+
+
+
 # -----------------------------------------------------------------------------
 # 数据并行初始化
 """
