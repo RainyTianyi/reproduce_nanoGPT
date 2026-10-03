@@ -571,16 +571,16 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
+        
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            
         # 在计算过程中，进一步使用 BF16 来减少内存开销和数据传输开销
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         # 注意！这里需要重新计算平均值，因为 torch 对每个 micro_step 的反向传播只做了累加。
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
-        # 使用 DDP 时，需要在最后一个 micro_step 进行多卡同步梯度
-        # 所以必须在反向传播前声明需要同步
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
     # loss_accum 只保存了本进程的值，因此也需要额外同步
     if ddp:
